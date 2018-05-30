@@ -11,7 +11,7 @@ import (
 )
 
 func TestEtcdRegistry(t *testing.T) {
-	s := server.NewServer()
+	s := server.NewServer(nil)
 
 	r := &EtcdRegisterPlugin{
 		ServiceAddress: "tcp@127.0.0.1:8972",

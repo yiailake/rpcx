@@ -9,7 +9,7 @@ import (
 )
 
 func TestXClient_IT(t *testing.T) {
-	s := server.NewServer()
+	s := server.Server{}
 	s.RegisterName("Arith", new(Arith), "")
 	go s.Serve("tcp", "127.0.0.1:0")
 	defer s.Close()
@@ -18,7 +18,7 @@ func TestXClient_IT(t *testing.T) {
 	addr := s.Address().String()
 
 	d := NewPeer2PeerDiscovery("tcp@"+addr, "desc=a test service")
-	xclient := NewXClient("Arith", Failtry, RandomSelect, d, DefaultOption)
+	xclient := NewXClient("Arith", "Mul", Failtry, RandomSelect, d, DefaultOption)
 
 	defer xclient.Close()
 
@@ -28,29 +28,12 @@ func TestXClient_IT(t *testing.T) {
 	}
 
 	reply := &Reply{}
-	err := xclient.Call(context.Background(), "Mul", args, reply)
+	err := xclient.Call(context.Background(), args, reply)
 	if err != nil {
 		t.Fatalf("failed to call: %v", err)
 	}
 
 	if reply.C != 200 {
 		t.Fatalf("expect 200 but got %d", reply.C)
-	}
-}
-
-func TestXClient_filterByStateAndGroup(t *testing.T) {
-	servers := map[string]string{"a": "", "b": "state=inactive&ops=10", "c": "ops=20", "d": "group=test&ops=20"}
-	filterByStateAndGroup("test", servers)
-	if _, ok := servers["b"]; ok {
-		t.Error("has not remove inactive node")
-	}
-	if _, ok := servers["a"]; ok {
-		t.Error("has not remove inactive node")
-	}
-	if _, ok := servers["c"]; ok {
-		t.Error("has not remove inactive node")
-	}
-	if _, ok := servers["d"]; !ok {
-		t.Error("node must be removed")
 	}
 }

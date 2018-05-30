@@ -3,14 +3,12 @@ package client
 import (
 	"context"
 	"errors"
-	"net/url"
 	"reflect"
 	"strings"
 	"sync"
 	"time"
 
 	ex "github.com/smallnest/rpcx/errors"
-	"github.com/smallnest/rpcx/protocol"
 	"github.com/smallnest/rpcx/share"
 )
 
@@ -27,15 +25,13 @@ var (
 // One XClient is used only for one service. You should create multiple XClient for multiple services.
 type XClient interface {
 	SetPlugins(plugins PluginContainer)
-	SetSelector(s Selector)
-	ConfigGeoSelector(latitude, longitude float64)
+	SetGeoSelector(latitude, longitude float64)
 	Auth(auth string)
 
-	Go(ctx context.Context, serviceMethod string, args interface{}, reply interface{}, done chan *Call) (*Call, error)
-	Call(ctx context.Context, serviceMethod string, args interface{}, reply interface{}) error
-	Broadcast(ctx context.Context, serviceMethod string, args interface{}, reply interface{}) error
-	Fork(ctx context.Context, serviceMethod string, args interface{}, reply interface{}) error
-	SendRaw(ctx context.Context, r *protocol.Message) (map[string]string, []byte, error)
+	Go(ctx context.Context, args interface{}, reply interface{}, done chan *Call) (*Call, error)
+	Call(ctx context.Context, args interface{}, reply interface{}) error
+	Broadcast(ctx context.Context, args interface{}, reply interface{}) error
+	Fork(ctx context.Context, args interface{}, reply interface{}) error
 	Close() error
 }
 
@@ -49,9 +45,6 @@ type KVPair struct {
 type ServiceDiscovery interface {
 	GetServices() []*KVPair
 	WatchService() chan []*KVPair
-	RemoveWatcher(ch chan []*KVPair)
-	Clone(servicePath string) ServiceDiscovery
-	Close()
 }
 
 type xClient struct {
@@ -73,21 +66,23 @@ type xClient struct {
 	auth string
 
 	Plugins PluginContainer
-
-	ch chan []*KVPair
-
-	serverMessageChan chan<- *protocol.Message
 }
 
 // NewXClient creates a XClient that supports service discovery and service governance.
-func NewXClient(servicePath string, failMode FailMode, selectMode SelectMode, discovery ServiceDiscovery, option Option) XClient {
+func NewXClient(servicePath, serviceMethod string, failMode FailMode, selectMode SelectMode, discovery ServiceDiscovery, option Option) XClient {
 	client := &xClient{
-		failMode:     failMode,
-		selectMode:   selectMode,
-		discovery:    discovery,
-		servicePath:  servicePath,
-		cachedClient: make(map[string]RPCClient),
-		option:       option,
+		failMode:      failMode,
+		selectMode:    selectMode,
+		discovery:     discovery,
+		servicePath:   servicePath,
+		serviceMethod: serviceMethod,
+		cachedClient:  make(map[string]RPCClient),
+		option:        option,
+	}
+
+	ch := client.discovery.WatchService()
+	if ch != nil {
+		go client.watch(ch)
 	}
 
 	servers := make(map[string]string)
@@ -95,77 +90,23 @@ func NewXClient(servicePath string, failMode FailMode, selectMode SelectMode, di
 	for _, p := range pairs {
 		servers[p.Key] = p.Value
 	}
-	filterByStateAndGroup(client.option.Group, servers)
-
 	client.servers = servers
-	if selectMode != Closest && selectMode != SelectByUser {
+	if selectMode != Closest {
 		client.selector = newSelector(selectMode, servers)
 	}
 
 	client.Plugins = &pluginContainer{}
-
-	ch := client.discovery.WatchService()
-	if ch != nil {
-		client.ch = ch
-		go client.watch(ch)
-	}
-
 	return client
 }
 
-// NewBidirectionalXClient creates a new xclient that can receive notifications from servers.
-func NewBidirectionalXClient(servicePath string, failMode FailMode, selectMode SelectMode, discovery ServiceDiscovery, option Option, serverMessageChan chan<- *protocol.Message) XClient {
-	client := &xClient{
-		failMode:          failMode,
-		selectMode:        selectMode,
-		discovery:         discovery,
-		servicePath:       servicePath,
-		cachedClient:      make(map[string]RPCClient),
-		option:            option,
-		serverMessageChan: serverMessageChan,
-	}
-
-	servers := make(map[string]string)
-	pairs := discovery.GetServices()
-	for _, p := range pairs {
-		servers[p.Key] = p.Value
-	}
-	filterByStateAndGroup(client.option.Group, servers)
-	client.servers = servers
-	if selectMode != Closest && selectMode != SelectByUser {
-		client.selector = newSelector(selectMode, servers)
-	}
-
-	client.Plugins = &pluginContainer{}
-
-	ch := client.discovery.WatchService()
-	if ch != nil {
-		client.ch = ch
-		go client.watch(ch)
-	}
-
-	return client
-}
-
-// SetSelector sets customized selector by users.
-func (c *xClient) SetSelector(s Selector) {
-	c.mu.RLock()
-	s.UpdateServer(c.servers)
-	c.mu.RUnlock()
-
-	c.selector = s
-}
-
-// SetPlugins sets client's plugins.
+// SetGeoSelector sets GeoSelector with client's latitude and longitude.
 func (c *xClient) SetPlugins(plugins PluginContainer) {
 	c.Plugins = plugins
 }
 
-// ConfigGeoSelector sets location of client's latitude and longitude,
-// and use newGeoSelector.
-func (c *xClient) ConfigGeoSelector(latitude, longitude float64) {
+// SetGeoSelector sets GeoSelector with client's latitude and longitude.
+func (c *xClient) SetGeoSelector(latitude, longitude float64) {
 	c.selector = newGeoSelector(c.servers, latitude, longitude)
-	c.selectMode = Closest
 }
 
 // Auth sets s token for Authentication.
@@ -176,31 +117,15 @@ func (c *xClient) Auth(auth string) {
 // watch changes of service and update cached clients.
 func (c *xClient) watch(ch chan []*KVPair) {
 	for pairs := range ch {
+
 		servers := make(map[string]string)
 		for _, p := range pairs {
 			servers[p.Key] = p.Value
 		}
 		c.mu.Lock()
-		filterByStateAndGroup(c.option.Group, servers)
 		c.servers = servers
-
-		if c.selector != nil {
-			c.selector.UpdateServer(servers)
-		}
-
+		// TODO update other fields
 		c.mu.Unlock()
-	}
-}
-func filterByStateAndGroup(group string, servers map[string]string) {
-	for k, v := range servers {
-		if values, err := url.ParseQuery(v); err == nil {
-			if state := values.Get("state"); state == "inactive" {
-				delete(servers, k)
-			}
-			if group != "" && group != values.Get("group") {
-				delete(servers, k)
-			}
-		}
 	}
 }
 
@@ -245,44 +170,9 @@ func (c *xClient) getCachedClient(k string) (RPCClient, error) {
 			}
 		}
 
-		client.RegisterServerMessageChan(c.serverMessageChan)
-
 		c.cachedClient[k] = client
 	}
 	c.mu.Unlock()
-
-	return client, nil
-}
-
-func (c *xClient) getCachedClientWithoutLock(k string) (RPCClient, error) {
-	client := c.cachedClient[k]
-	if client != nil {
-		if !client.IsClosing() && !client.IsShutdown() {
-			return client, nil
-		}
-	}
-
-	//double check
-	client = c.cachedClient[k]
-	if client == nil {
-		network, addr := splitNetworkAndAddress(k)
-		if network == "inprocess" {
-			client = InprocessClient
-		} else {
-			client = &Client{
-				option:  c.option,
-				Plugins: c.Plugins,
-			}
-			err := client.Connect(network, addr)
-			if err != nil {
-				return nil, err
-			}
-		}
-
-		client.RegisterServerMessageChan(c.serverMessageChan)
-
-		c.cachedClient[k] = client
-	}
 
 	return client, nil
 }
@@ -296,7 +186,6 @@ func (c *xClient) removeClient(k string, client RPCClient) {
 	c.mu.Unlock()
 
 	if client != nil {
-		client.UnregisterServerMessageChan()
 		client.Close()
 	}
 }
@@ -312,7 +201,7 @@ func splitNetworkAndAddress(server string) (string, string) {
 
 // Go invokes the function asynchronously. It returns the Call structure representing the invocation. The done channel will signal when the call is complete by returning the same Call object. If done is nil, Go will allocate a new channel. If non-nil, done must be buffered or Go will deliberately crash.
 // It does not use FailMode.
-func (c *xClient) Go(ctx context.Context, serviceMethod string, args interface{}, reply interface{}, done chan *Call) (*Call, error) {
+func (c *xClient) Go(ctx context.Context, args interface{}, reply interface{}, done chan *Call) (*Call, error) {
 	if c.isShutdown {
 		return nil, ErrXClientShutdown
 	}
@@ -326,16 +215,16 @@ func (c *xClient) Go(ctx context.Context, serviceMethod string, args interface{}
 		m[share.AuthKey] = c.auth
 	}
 
-	_, client, err := c.selectClient(ctx, c.servicePath, serviceMethod, args)
+	_, client, err := c.selectClient(ctx, c.servicePath, c.serviceMethod, args)
 	if err != nil {
 		return nil, err
 	}
-	return client.Go(ctx, c.servicePath, serviceMethod, args, reply, done), nil
+	return client.Go(ctx, c.servicePath, c.serviceMethod, args, reply, done), nil
 }
 
 // Call invokes the named function, waits for it to complete, and returns its error status.
 // It handles errors base on FailMode.
-func (c *xClient) Call(ctx context.Context, serviceMethod string, args interface{}, reply interface{}) error {
+func (c *xClient) Call(ctx context.Context, args interface{}, reply interface{}) error {
 	if c.isShutdown {
 		return ErrXClientShutdown
 	}
@@ -350,15 +239,9 @@ func (c *xClient) Call(ctx context.Context, serviceMethod string, args interface
 	}
 
 	var err error
-	k, client, err := c.selectClient(ctx, c.servicePath, serviceMethod, args)
-	if err != nil {
-		if c.failMode == Failfast {
-			return err
-		}
-
-		if _, ok := err.(ServiceError); ok {
-			return err
-		}
+	k, client, err := c.selectClient(ctx, c.servicePath, c.serviceMethod, args)
+	if err != nil && c.failMode == Failfast {
+		return err
 	}
 
 	switch c.failMode {
@@ -366,93 +249,36 @@ func (c *xClient) Call(ctx context.Context, serviceMethod string, args interface
 		retries := c.option.Retries
 		for retries > 0 {
 			retries--
-
-			if client != nil {
-				err = c.wrapCall(ctx, client, serviceMethod, args, reply)
-				if err == nil {
-					return nil
-				}
-				if _, ok := err.(ServiceError); ok {
-					return err
-				}
+			err = c.wrapCall(ctx, client, args, reply)
+			if err == nil {
+				return nil
+			}
+			if _, ok := err.(ServiceError); !ok {
+				c.removeClient(k, client)
 			}
 
-			c.removeClient(k, client)
-			client, err = c.getCachedClient(k)
+			client, _ = c.getCachedClient(k)
 		}
 		return err
 	case Failover:
 		retries := c.option.Retries
 		for retries > 0 {
 			retries--
-
-			if client != nil {
-				err = c.wrapCall(ctx, client, serviceMethod, args, reply)
-				if err == nil {
-					return nil
-				}
-				if _, ok := err.(ServiceError); ok {
-					return err
-				}
-			}
-
-			c.removeClient(k, client)
-			//select another server
-			k, client, err = c.selectClient(ctx, c.servicePath, serviceMethod, args)
-		}
-
-		return err
-	case Failbackup:
-		ctx, cancelFn := context.WithCancel(ctx)
-		defer cancelFn()
-		call1 := make(chan *Call, 10)
-		call2 := make(chan *Call, 10)
-		reply1 := reflect.New(reflect.ValueOf(reply).Elem().Type()).Interface()
-		reply2 := reflect.New(reflect.ValueOf(reply).Elem().Type()).Interface()
-
-		_, err1 := c.Go(ctx, serviceMethod, args, reply1, call1)
-
-		t := time.NewTimer(c.option.BackupLatency)
-		select {
-		case <-ctx.Done(): //cancel by context
-			err = ctx.Err()
-			return err
-		case call := <-call1:
-			err = call.Error
+			err = c.wrapCall(ctx, client, args, reply)
 			if err == nil {
-				reflect.ValueOf(reply).Elem().Set(reflect.ValueOf(reply1).Elem())
+				return nil
 			}
-			return err
-		case <-t.C:
-
-		}
-		_, err2 := c.Go(ctx, serviceMethod, args, reply2, call2)
-		if err2 != nil {
 			if _, ok := err.(ServiceError); !ok {
 				c.removeClient(k, client)
 			}
-			err = err1
-			return err
-		}
-
-		select {
-		case <-ctx.Done(): //cancel by context
-			err = ctx.Err()
-		case call := <-call1:
-			err = call.Error
-			if err == nil {
-				reflect.ValueOf(reply).Elem().Set(reflect.ValueOf(reply1).Elem())
-			}
-		case call := <-call2:
-			err = call.Error
-			if err == nil {
-				reflect.ValueOf(reply).Elem().Set(reflect.ValueOf(reply2).Elem())
-			}
+			//select another server
+			k, client, _ = c.selectClient(ctx, c.servicePath, c.serviceMethod, args)
 		}
 
 		return err
+
 	default: //Failfast
-		err = c.wrapCall(ctx, client, serviceMethod, args, reply)
+		err = c.wrapCall(ctx, client, args, reply)
 		if err != nil {
 			if _, ok := err.(ServiceError); !ok {
 				c.removeClient(k, client)
@@ -463,99 +289,20 @@ func (c *xClient) Call(ctx context.Context, serviceMethod string, args interface
 	}
 }
 
-func (c *xClient) SendRaw(ctx context.Context, r *protocol.Message) (map[string]string, []byte, error) {
-	if c.isShutdown {
-		return nil, nil, ErrXClientShutdown
-	}
-
-	if c.auth != "" {
-		metadata := ctx.Value(share.ReqMetaDataKey)
-		if metadata == nil {
-			return nil, nil, errors.New("must set ReqMetaDataKey in context")
-		}
-		m := metadata.(map[string]string)
-		m[share.AuthKey] = c.auth
-	}
-
-	var err error
-	k, client, err := c.selectClient(ctx, r.ServicePath, r.ServiceMethod, r.Payload)
-
-	if err != nil {
-		if c.failMode == Failfast {
-			return nil, nil, err
-		}
-
-		if _, ok := err.(ServiceError); ok {
-			return nil, nil, err
-		}
-	}
-
-	switch c.failMode {
-	case Failtry:
-		retries := c.option.Retries
-		for retries > 0 {
-			retries--
-			if client != nil {
-				m, payload, err := client.SendRaw(ctx, r)
-				if err == nil {
-					return m, payload, nil
-				}
-				if _, ok := err.(ServiceError); ok {
-					return nil, nil, err
-				}
-			}
-
-			c.removeClient(k, client)
-			client, err = c.getCachedClient(k)
-		}
-		return nil, nil, err
-	case Failover:
-		retries := c.option.Retries
-		for retries > 0 {
-			retries--
-			if client != nil {
-				m, payload, err := client.SendRaw(ctx, r)
-				if err == nil {
-					return m, payload, nil
-				}
-				if _, ok := err.(ServiceError); ok {
-					return nil, nil, err
-				}
-			}
-
-			c.removeClient(k, client)
-			//select another server
-			k, client, err = c.selectClient(ctx, r.ServicePath, r.ServiceMethod, r.Payload)
-		}
-
-		return nil, nil, err
-
-	default: //Failfast
-		m, payload, err := client.SendRaw(ctx, r)
-
-		if err != nil {
-			if _, ok := err.(ServiceError); !ok {
-				c.removeClient(k, client)
-			}
-		}
-
-		return m, payload, nil
-	}
-}
-func (c *xClient) wrapCall(ctx context.Context, client RPCClient, serviceMethod string, args interface{}, reply interface{}) error {
+func (c *xClient) wrapCall(ctx context.Context, client RPCClient, args interface{}, reply interface{}) error {
 	if client == nil {
 		return ErrServerUnavailable
 	}
-	c.Plugins.DoPreCall(ctx, c.servicePath, serviceMethod, args)
-	err := client.Call(ctx, c.servicePath, serviceMethod, args, reply)
-	c.Plugins.DoPostCall(ctx, c.servicePath, serviceMethod, args, reply, err)
+	c.Plugins.DoPreCall(ctx, c.servicePath, c.serviceMethod, args)
+	err := client.Call(ctx, c.servicePath, c.serviceMethod, args, reply)
+	c.Plugins.DoPostCall(ctx, c.servicePath, c.serviceMethod, args, reply, err)
 	return err
 }
 
 // Broadcast sends requests to all servers and Success only when all servers return OK.
 // FailMode and SelectMode are meanless for this method.
 // Please set timeout to avoid hanging.
-func (c *xClient) Broadcast(ctx context.Context, serviceMethod string, args interface{}, reply interface{}) error {
+func (c *xClient) Broadcast(ctx context.Context, args interface{}, reply interface{}) error {
 	if c.isShutdown {
 		return ErrXClientShutdown
 	}
@@ -572,7 +319,7 @@ func (c *xClient) Broadcast(ctx context.Context, serviceMethod string, args inte
 	var clients []RPCClient
 	c.mu.RLock()
 	for k := range c.servers {
-		client, err := c.getCachedClientWithoutLock(k)
+		client, err := c.getCachedClient(k)
 		if err != nil {
 			c.mu.RUnlock()
 			return err
@@ -591,7 +338,7 @@ func (c *xClient) Broadcast(ctx context.Context, serviceMethod string, args inte
 	for _, client := range clients {
 		client := client
 		go func() {
-			err = c.wrapCall(ctx, client, serviceMethod, args, reply)
+			err = c.wrapCall(ctx, client, args, reply)
 			done <- (err == nil)
 		}()
 	}
@@ -615,7 +362,7 @@ check:
 
 // Fork sends requests to all servers and Success once one server returns OK.
 // FailMode and SelectMode are meanless for this method.
-func (c *xClient) Fork(ctx context.Context, serviceMethod string, args interface{}, reply interface{}) error {
+func (c *xClient) Fork(ctx context.Context, args interface{}, reply interface{}) error {
 	if c.isShutdown {
 		return ErrXClientShutdown
 	}
@@ -632,7 +379,7 @@ func (c *xClient) Fork(ctx context.Context, serviceMethod string, args interface
 	var clients []RPCClient
 	c.mu.RLock()
 	for k := range c.servers {
-		client, err := c.getCachedClientWithoutLock(k)
+		client, err := c.getCachedClient(k)
 		if err != nil {
 			c.mu.RUnlock()
 			return err
@@ -640,6 +387,7 @@ func (c *xClient) Fork(ctx context.Context, serviceMethod string, args interface
 		clients = append(clients, client)
 	}
 	c.mu.RUnlock()
+
 	if len(clients) == 0 {
 		return ErrXClientNoServer
 	}
@@ -651,10 +399,10 @@ func (c *xClient) Fork(ctx context.Context, serviceMethod string, args interface
 		client := client
 		go func() {
 			clonedReply := reflect.New(reflect.ValueOf(reply).Elem().Type()).Interface()
-			err = c.wrapCall(ctx, client, serviceMethod, args, clonedReply)
+			err = c.wrapCall(ctx, client, args, clonedReply)
 			done <- (err == nil)
 			if err == nil {
-				reflect.ValueOf(reply).Elem().Set(reflect.ValueOf(clonedReply).Elem())
+				reflect.ValueOf(reply).Set(reflect.ValueOf(clonedReply))
 			}
 		}()
 	}
@@ -686,27 +434,14 @@ func (c *xClient) Close() error {
 
 	var errs []error
 	c.mu.Lock()
-	for k, v := range c.cachedClient {
+	for _, v := range c.cachedClient {
 		e := v.Close()
 		if e != nil {
 			errs = append(errs, e)
 		}
 
-		delete(c.cachedClient, k)
-
 	}
 	c.mu.Unlock()
-
-	go func() {
-		defer func() {
-			if r := recover(); r != nil {
-
-			}
-		}()
-
-		c.discovery.RemoveWatcher(c.ch)
-		close(c.ch)
-	}()
 
 	if len(errs) > 0 {
 		return ex.NewMultiError(errs)

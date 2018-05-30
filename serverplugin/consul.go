@@ -9,7 +9,6 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/docker/libkv"
@@ -34,30 +33,28 @@ type ConsulRegisterPlugin struct {
 	Metrics  metrics.Registry
 	// Registered services
 	Services       []string
-	metasLock      sync.RWMutex
-	metas          map[string]string
 	UpdateInterval time.Duration
 
 	Options *store.Config
-	kv      store.Store
+	KV      store.Store
 }
 
 // Start starts to connect consul cluster
 func (p *ConsulRegisterPlugin) Start() error {
-	if p.kv == nil {
+	if p.KV == nil {
 		kv, err := libkv.NewStore(store.CONSUL, p.ConsulServers, p.Options)
 		if err != nil {
 			log.Errorf("cannot create consul registry: %v", err)
 			return err
 		}
-		p.kv = kv
+		p.KV = kv
 	}
 
 	if p.BasePath[0] == '/' {
 		p.BasePath = p.BasePath[1:]
 	}
 
-	err := p.kv.Put(p.BasePath, []byte("rpcx_path"), &store.WriteOptions{IsDir: true})
+	err := p.KV.Put(p.BasePath, []byte("rpcx_path"), &store.WriteOptions{IsDir: true})
 	if err != nil {
 		log.Errorf("cannot create consul path %s: %v", p.BasePath, err)
 		return err
@@ -66,35 +63,22 @@ func (p *ConsulRegisterPlugin) Start() error {
 	if p.UpdateInterval > 0 {
 		ticker := time.NewTicker(p.UpdateInterval)
 		go func() {
-			defer p.kv.Close()
+			defer p.KV.Close()
 
 			// refresh service TTL
 			for range ticker.C {
-				var data []byte
-				if p.Metrics != nil {
-					clientMeter := metrics.GetOrRegisterMeter("clientMeter", p.Metrics)
-					data = []byte(strconv.FormatInt(clientMeter.Count()/60, 10))
-				}
-
+				clientMeter := metrics.GetOrRegisterMeter("clientMeter", p.Metrics)
+				data := []byte(strconv.FormatInt(clientMeter.Count()/60, 10))
 				//set this same metrics for all services at this server
 				for _, name := range p.Services {
 					nodePath := fmt.Sprintf("%s/%s/%s", p.BasePath, name, p.ServiceAddress)
-					kvPaire, err := p.kv.Get(nodePath)
+					kvPaire, err := p.KV.Get(nodePath)
 					if err != nil {
-						log.Warnf("can't get data of node: %s, will re-create, because of %v", nodePath, err.Error())
-
-						p.metasLock.RLock()
-						meta := p.metas[name]
-						p.metasLock.RUnlock()
-
-						err = p.kv.Put(nodePath, []byte(meta), &store.WriteOptions{TTL: p.UpdateInterval * 3})
-						if err != nil {
-							log.Errorf("cannot re-create consul path %s: %v", nodePath, err)
-						}
+						log.Infof("can't get data of node: %s, because of %v", nodePath, err.Error())
 					} else {
 						v, _ := url.ParseQuery(string(kvPaire.Value))
 						v.Set("tps", string(data))
-						p.kv.Put(nodePath, []byte(v.Encode()), &store.WriteOptions{TTL: p.UpdateInterval * 3})
+						p.KV.Put(nodePath, []byte(v.Encode()), &store.WriteOptions{TTL: p.UpdateInterval * 2})
 					}
 				}
 
@@ -122,46 +106,39 @@ func (p *ConsulRegisterPlugin) Register(name string, rcvr interface{}, metadata 
 		return
 	}
 
-	if p.kv == nil {
+	if p.KV == nil {
 		consul.Register()
 		kv, err := libkv.NewStore(store.CONSUL, p.ConsulServers, nil)
 		if err != nil {
 			log.Errorf("cannot create consul registry: %v", err)
 			return err
 		}
-		p.kv = kv
+		p.KV = kv
 	}
 
 	if p.BasePath[0] == '/' {
 		p.BasePath = p.BasePath[1:]
 	}
-	err = p.kv.Put(p.BasePath, []byte("rpcx_path"), &store.WriteOptions{IsDir: true})
+	err = p.KV.Put(p.BasePath, []byte("rpcx_path"), &store.WriteOptions{IsDir: true})
 	if err != nil {
 		log.Errorf("cannot create consul path %s: %v", p.BasePath, err)
 		return err
 	}
 
 	nodePath := fmt.Sprintf("%s/%s", p.BasePath, name)
-	err = p.kv.Put(nodePath, []byte(name), &store.WriteOptions{IsDir: true})
+	err = p.KV.Put(nodePath, []byte(name), &store.WriteOptions{IsDir: true})
 	if err != nil {
 		log.Errorf("cannot create consul path %s: %v", nodePath, err)
 		return err
 	}
 
 	nodePath = fmt.Sprintf("%s/%s/%s", p.BasePath, name, p.ServiceAddress)
-	err = p.kv.Put(nodePath, []byte(metadata), &store.WriteOptions{TTL: p.UpdateInterval * 2})
+	err = p.KV.Put(nodePath, []byte(p.ServiceAddress), &store.WriteOptions{TTL: p.UpdateInterval * 2})
 	if err != nil {
 		log.Errorf("cannot create consul path %s: %v", nodePath, err)
 		return err
 	}
 
 	p.Services = append(p.Services, name)
-
-	p.metasLock.Lock()
-	if p.metas == nil {
-		p.metas = make(map[string]string)
-	}
-	p.metas[name] = metadata
-	p.metasLock.Unlock()
 	return
 }

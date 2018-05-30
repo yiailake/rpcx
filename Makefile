@@ -12,10 +12,7 @@ tools:
 	go get github.com/gordonklaus/ineffassign
 	go get github.com/fzipp/gocyclo
 	go get github.com/golang/lint/golint
-	go get github.com/alexkohler/prealloc
 
-gometalinter:
-	gometalinter --enable-all ./...
 lint:
 	golint ./...
 
@@ -32,12 +29,9 @@ ineffassign:
 	ineffassign .
 
 gocyclo:
-	gocyclo -over 20 $(shell find . -name "*.go" |egrep -v "_testutils/*|vendor/*|pb\.go|_test\.go")
+	@ gocyclo -over 20 $(shell find . -name "*.go" |egrep -v "_testutils/*|vendor/*|pb\.go|_test\.go")
 
-prealloc:
-	prealloc ./...
-
-check: staticcheck gosimple ineffassign
+check: staticcheck gosimple ineffassign gocyclo
 
 doc:
 	godoc -http=:6060
@@ -49,10 +43,10 @@ fmt:
 	go fmt ./...
 
 build:
-	go build ./...
+	go build -tags "udp zookeeper etcd consul ping" ./...
 
-build-all:
-	go build -tags "reuseport kcp quic zookeeper etcd consul ping" ./...
+buildu:
+	go build -tags "udp zookeeper etcd consul ping" ./...
 
 test:
-	go test -race -tags "reuseport kcp quic zookeeper etcd consul ping" ./...
+	go test -tags "udp zookeeper etcd consul ping" ./...

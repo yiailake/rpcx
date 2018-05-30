@@ -67,12 +67,8 @@ func (p *MDNSRegisterPlugin) Start() error {
 					continue
 				}
 
-				var data []byte
-				if p.Metrics != nil {
-					clientMeter := metrics.GetOrRegisterMeter("clientMeter", p.Metrics)
-					data = []byte(strconv.FormatInt(clientMeter.Count()/60, 10))
-				}
-
+				clientMeter := metrics.GetOrRegisterMeter("clientMeter", p.Metrics)
+				data := []byte(strconv.FormatInt(clientMeter.Count()/60, 10))
 				//set this same metrics for all services at this server
 				for _, sm := range p.Services {
 					v, _ := url.ParseQuery(string(sm.Meta))
