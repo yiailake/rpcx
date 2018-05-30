@@ -9,20 +9,17 @@ import (
 	"github.com/smallnest/rpcx/util"
 )
 
-// MaxMessageLength is the max length of a message.
-// Default is 0 that means does not limit length of messages.
-// It is used to validate when read messages from io.Reader.
-var MaxMessageLength = 0
-
 const (
 	magicNumber byte = 0x08
 )
 
 var (
+	lineSeparator = []byte("\r\n")
+)
+
+var (
 	// ErrMetaKVMissing some keys or values are mssing.
 	ErrMetaKVMissing = errors.New("wrong metadata lines. some keys or values are missing")
-	// ErrMessageToLong message is too long
-	ErrMessageToLong = errors.New("message is too long")
 )
 
 const (
@@ -116,7 +113,7 @@ func (h *Header) SetVersion(v byte) {
 
 // MessageType returns the message type.
 func (h Header) MessageType() MessageType {
-	return MessageType(h[2]&0x80) >> 7
+	return MessageType(h[2] & 0x80)
 }
 
 // SetMessageType sets message type.
@@ -147,9 +144,9 @@ func (h Header) IsOneway() bool {
 // SetOneway sets the oneway flag.
 func (h *Header) SetOneway(oneway bool) {
 	if oneway {
-		h[2] = h[2] | 0x20
+		h[2] = h[2] | 0x40
 	} else {
-		h[2] = h[2] &^ 0x20
+		h[2] = h[2] &^ 0x40
 	}
 }
 
@@ -160,7 +157,7 @@ func (h Header) CompressType() CompressType {
 
 // SetCompressType sets the compression type.
 func (h *Header) SetCompressType(ct CompressType) {
-	h[2] = (h[2] &^ 0x1C) | ((byte(ct) << 2) & 0x1C)
+	h[2] = h[2] | ((byte(ct) << 2) & 0x1C)
 }
 
 // MessageStatusType returns the message status type.
@@ -170,7 +167,7 @@ func (h Header) MessageStatusType() MessageStatusType {
 
 // SetMessageStatusType sets message status type.
 func (h *Header) SetMessageStatusType(mt MessageStatusType) {
-	h[2] = (h[2] &^ 0x03) | (byte(mt) & 0x03)
+	h[2] = h[2] | (byte(mt) & 0x03)
 }
 
 // SerializeType returns serialization type of payload.
@@ -180,7 +177,7 @@ func (h Header) SerializeType() SerializeType {
 
 // SetSerializeType sets the serialization type.
 func (h *Header) SetSerializeType(st SerializeType) {
-	h[3] = (h[3] &^ 0xF0) | (byte(st) << 4)
+	h[3] = h[3] | (byte(st) << 4)
 }
 
 // Seq returns sequence number of messages.
@@ -196,10 +193,11 @@ func (h *Header) SetSeq(seq uint64) {
 // Clone clones from an message.
 func (m Message) Clone() *Message {
 	header := *m.Header
-	c := GetPooledMsg()
-	c.Header = &header
-	c.ServicePath = m.ServicePath
-	c.ServiceMethod = m.ServiceMethod
+	c := &Message{
+		Header:        &header,
+		ServicePath:   m.ServicePath,
+		ServiceMethod: m.ServiceMethod,
+	}
 	return c
 }
 
@@ -353,7 +351,7 @@ func Read(r io.Reader) (*Message, error) {
 
 // Decode decodes a message from reader.
 func (m *Message) Decode(r io.Reader) error {
-	// validate rest length for each step?
+	// TODO: validate
 
 	// parse header
 	_, err := io.ReadFull(r, m.Header[:])
@@ -362,19 +360,14 @@ func (m *Message) Decode(r io.Reader) error {
 	}
 
 	//total
-	lenData := poolUint32Data.Get().(*[]byte)
+	lenData := poolUint32Dada.Get().(*[]byte)
 	_, err = io.ReadFull(r, *lenData)
 	if err != nil {
-		poolUint32Data.Put(lenData)
+		poolUint32Dada.Put(lenData)
 		return err
 	}
 	l := binary.BigEndian.Uint32(*lenData)
-	poolUint32Data.Put(lenData)
-
-	if MaxMessageLength > 0 && int(l) > MaxMessageLength {
-		return ErrMessageToLong
-	}
-
+	poolUint32Dada.Put(lenData)
 	data := make([]byte, int(l))
 	_, err = io.ReadFull(r, data)
 	if err != nil {
@@ -417,21 +410,4 @@ func (m *Message) Decode(r io.Reader) error {
 	m.Payload = data[n:]
 
 	return err
-}
-
-// Reset clean data of this message but keep allocated data
-func (m *Message) Reset() {
-	resetHeader(m.Header)
-	m.Metadata = nil
-	m.Payload = m.Payload[:0]
-	m.data = m.data[:0]
-	m.ServicePath = ""
-	m.ServiceMethod = ""
-}
-
-var zeroHeaderArray Header
-var zeroHeader = zeroHeaderArray[1:]
-
-func resetHeader(h *Header) {
-	copy(h[1:], zeroHeader)
 }

@@ -35,10 +35,6 @@ func SetLogger(logger Logger) {
 	l = logger
 }
 
-func SetDummyLogger() {
-	l = &dummyLogger{}
-}
-
 func Debug(v ...interface{}) {
 	l.Debug(v...)
 }

@@ -2,31 +2,30 @@ package protocol
 
 import "sync"
 
-var msgPool = sync.Pool{
-	New: func() interface{} {
-		header := Header([12]byte{})
-		header[0] = magicNumber
+// var maxBytes = 10240
+// var poolRequestDada = sync.Pool{
+// 	New: func() interface{} {
+// 		return make([]byte, maxBytes)
+// 	},
+// }
 
-		return &Message{
-			Header: &header,
-		}
-	},
-}
+// func getBytes(l int) []byte {
+// 	b := poolRequestDada.Get().([]byte)
+// 	if len(b) < l {
+// 		poolRequestDada.Put(b)
+// 		return make([]byte, l)
+// 	}
 
-// GetPooledMsg gets a pooled message.
-func GetPooledMsg() *Message {
-	return msgPool.Get().(*Message)
-}
+// 	return b[:l]
+// }
 
-// FreeMsg puts a msg into the pool.
-func FreeMsg(msg *Message) {
-	if msg != nil {
-		msg.Reset()
-		msgPool.Put(msg)
-	}
-}
+// func freeBytes(b []byte) {
+// 	if len(b) <= maxBytes {
+// 		poolRequestDada.Put(b)
+// 	}
+// }
 
-var poolUint32Data = sync.Pool{
+var poolUint32Dada = sync.Pool{
 	New: func() interface{} {
 		data := make([]byte, 4)
 		return &data

@@ -34,7 +34,7 @@ func (s *weightedICMPSelector) UpdateServer(servers map[string]string) {
 }
 
 func createICMPWeighted(servers map[string]string) []*Weighted {
-	var ss = make([]*Weighted, 0, len(servers))
+	var ss []*Weighted
 	for k := range servers {
 		w := &Weighted{Server: k, Weight: 1, EffectiveWeight: 1}
 		server := strings.Split(k, "@")
@@ -45,6 +45,7 @@ func createICMPWeighted(servers map[string]string) []*Weighted {
 		w.EffectiveWeight = rtt
 		ss = append(ss, w)
 	}
+
 	return ss
 }
 
@@ -68,7 +69,7 @@ func Ping(host string) (rtt int, err error) {
 	// }
 	err = p.Run()
 
-	return rtt, err
+	return
 }
 
 // CalculateWeight converts the rtt to weighted by:
@@ -82,7 +83,7 @@ func Ping(host string) (rtt int, err error) {
 // It is hard coded based on Ops experience.
 func CalculateWeight(rtt int) int {
 	switch {
-	case rtt >= 0 && rtt <= 10:
+	case rtt > 0 && rtt <= 10:
 		return 191
 	case rtt > 10 && rtt <= 200:
 		return 201 - rtt
