@@ -14,6 +14,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/smallnest/rpcx/log"
@@ -44,13 +45,17 @@ var (
 	// services with context.WithValue to access the connection arrived on.
 	// The associated value will be of type net.Conn.
 	RemoteConnContextKey = &contextKey{"remote-conn"}
+	// StartRequestContextKey records the start time
+	StartRequestContextKey = &contextKey{"start-parse-request"}
+	// StartSendRequestContextKey records the start time
+	StartSendRequestContextKey = &contextKey{"start-send-request"}
 )
 
 // Server is rpcx server that use TCP or UDP.
 type Server struct {
 	ln           net.Listener
-	ReadTimeout  time.Duration
-	WriteTimeout time.Duration
+	readTimeout  time.Duration
+	writeTimeout time.Duration
 
 	serviceMapMu sync.RWMutex
 	serviceMap   map[string]*service
@@ -58,14 +63,15 @@ type Server struct {
 	mu         sync.RWMutex
 	activeConn map[net.Conn]struct{}
 	doneChan   chan struct{}
+	seq        uint64
 
-	inShutdown int32
+	// inShutdown int32
 	onShutdown []func()
 
 	// TLSConfig for creating tls tcp connection.
-	TLSConfig *tls.Config
+	tlsConfig *tls.Config
 	// BlockCrypt for kcp.BlockCrypt
-	Options map[string]interface{}
+	options map[string]interface{}
 	// // use for KCP
 	// KCPConfig KCPConfig
 	// // for QUIC
@@ -74,14 +80,21 @@ type Server struct {
 	Plugins PluginContainer
 
 	// AuthFunc can be used to auth.
-	AuthFunc func(req *protocol.Message, token string) error
+	AuthFunc func(ctx context.Context, req *protocol.Message, token string) error
 }
 
 // NewServer returns a server.
-func NewServer(options map[string]interface{}) *Server {
-	return &Server{
+func NewServer(options ...OptionFn) *Server {
+	s := &Server{
 		Plugins: &pluginContainer{},
+		options: make(map[string]interface{}),
 	}
+
+	for _, op := range options {
+		op(s)
+	}
+
+	return s
 }
 
 // Address returns listened address.
@@ -92,6 +105,36 @@ func (s *Server) Address() net.Addr {
 		return nil
 	}
 	return s.ln.Addr()
+}
+
+// SendMessage a request to the specified client.
+// The client is designated by the conn.
+// conn can be gotten from context in services:
+//
+//   ctx.Value(RemoteConnContextKey)
+//
+// servicePath, serviceMethod, metadata can be set to zero values.
+func (s *Server) SendMessage(conn net.Conn, servicePath, serviceMethod string, metadata map[string]string, data []byte) error {
+	ctx := context.WithValue(context.Background(), StartSendRequestContextKey, time.Now().UnixNano())
+	s.Plugins.DoPreWriteRequest(ctx)
+
+	req := protocol.GetPooledMsg()
+	req.SetMessageType(protocol.Request)
+
+	seq := atomic.AddUint64(&s.seq, 1)
+	req.SetSeq(seq)
+	req.SetOneway(true)
+	req.SetSerializeType(protocol.SerializeNone)
+	req.ServicePath = servicePath
+	req.ServiceMethod = serviceMethod
+	req.Metadata = metadata
+	req.Payload = data
+
+	reqData := req.Encode()
+	_, err := conn.Write(reqData)
+	s.Plugins.DoPostWriteRequest(ctx, req, err)
+	protocol.FreeMsg(req)
+	return err
 }
 
 func (s *Server) getDoneChan() <-chan struct{} {
@@ -117,6 +160,10 @@ func (s *Server) Serve(network, address string) (err error) {
 		s.serveByHTTP(ln, "")
 		return nil
 	}
+
+	// try to start gateway
+	ln = s.startGateway(network, ln)
+
 	return s.serveListener(ln)
 }
 
@@ -124,8 +171,6 @@ func (s *Server) Serve(network, address string) (err error) {
 // creating a new service goroutine for each.
 // The service goroutines read requests and then call services to reply to them.
 func (s *Server) serveListener(ln net.Listener) error {
-	s.ln = ln
-
 	if s.Plugins == nil {
 		s.Plugins = &pluginContainer{}
 	}
@@ -133,6 +178,7 @@ func (s *Server) serveListener(ln net.Listener) error {
 	var tempDelay time.Duration
 
 	s.mu.Lock()
+	s.ln = ln
 	if s.activeConn == nil {
 		s.activeConn = make(map[net.Conn]struct{})
 	}
@@ -227,10 +273,10 @@ func (s *Server) serveConn(conn net.Conn) {
 	}()
 
 	if tlsConn, ok := conn.(*tls.Conn); ok {
-		if d := s.ReadTimeout; d != 0 {
+		if d := s.readTimeout; d != 0 {
 			conn.SetReadDeadline(time.Now().Add(d))
 		}
-		if d := s.WriteTimeout; d != 0 {
+		if d := s.writeTimeout; d != 0 {
 			conn.SetWriteDeadline(time.Now().Add(d))
 		}
 		if err := tlsConn.Handshake(); err != nil {
@@ -239,16 +285,16 @@ func (s *Server) serveConn(conn net.Conn) {
 		}
 	}
 
-	ctx := context.WithValue(context.Background(), RemoteConnContextKey, conn)
 	r := bufio.NewReaderSize(conn, ReaderBuffsize)
 	//w := bufio.NewWriterSize(conn, WriterBuffsize)
 
 	for {
 		t0 := time.Now()
-		if s.ReadTimeout != 0 {
-			conn.SetReadDeadline(t0.Add(s.ReadTimeout))
+		if s.readTimeout != 0 {
+			conn.SetReadDeadline(t0.Add(s.readTimeout))
 		}
 
+		ctx := context.WithValue(context.Background(), RemoteConnContextKey, conn)
 		req, err := s.readRequest(ctx, r)
 		if err != nil {
 			if err == io.EOF {
@@ -261,10 +307,27 @@ func (s *Server) serveConn(conn net.Conn) {
 			return
 		}
 
-		if s.WriteTimeout != 0 {
-			conn.SetWriteDeadline(t0.Add(s.WriteTimeout))
+		if s.writeTimeout != 0 {
+			conn.SetWriteDeadline(t0.Add(s.writeTimeout))
 		}
 
+		ctx = context.WithValue(ctx, StartRequestContextKey, time.Now().UnixNano())
+		err = s.auth(ctx, req)
+		if err != nil {
+			s.Plugins.DoPreWriteResponse(ctx, req)
+			if !req.IsOneway() {
+				res := req.Clone()
+				res.SetMessageType(protocol.Response)
+				handleError(res, err)
+				data := res.Encode()
+				conn.Write(data)
+				s.Plugins.DoPostWriteResponse(ctx, req, res, err)
+				protocol.FreeMsg(res)
+			}
+
+			protocol.FreeMsg(req)
+			continue
+		}
 		go func() {
 			if req.IsHeartbeat() {
 				req.SetMessageType(protocol.Response)
@@ -278,9 +341,11 @@ func (s *Server) serveConn(conn net.Conn) {
 				share.ResMetaDataKey, resMetadata)
 
 			res, err := s.handleRequest(newCtx, req)
+
 			if err != nil {
 				log.Warnf("rpcx: failed to handle request: %v", err)
 			}
+
 			s.Plugins.DoPreWriteResponse(newCtx, req)
 			if !req.IsOneway() {
 				if len(resMetadata) > 0 { //copy meta in context to request
@@ -299,6 +364,9 @@ func (s *Server) serveConn(conn net.Conn) {
 				//res.WriteTo(conn)
 			}
 			s.Plugins.DoPostWriteResponse(newCtx, req, res, err)
+
+			protocol.FreeMsg(req)
+			protocol.FreeMsg(res)
 		}()
 	}
 }
@@ -306,27 +374,28 @@ func (s *Server) serveConn(conn net.Conn) {
 func (s *Server) readRequest(ctx context.Context, r io.Reader) (req *protocol.Message, err error) {
 	s.Plugins.DoPreReadRequest(ctx)
 	// pool req?
-	req = protocol.NewMessage()
+	req = protocol.GetPooledMsg()
 	err = req.Decode(r)
 	s.Plugins.DoPostReadRequest(ctx, req, err)
-
-	if s.AuthFunc != nil && err == nil {
-		token := req.Metadata[share.AuthKey]
-		err = s.AuthFunc(req, token)
-	}
-
 	return req, err
 }
 
+func (s *Server) auth(ctx context.Context, req *protocol.Message) error {
+	if s.AuthFunc != nil {
+		token := req.Metadata[share.AuthKey]
+		return s.AuthFunc(ctx, req, token)
+	}
+
+	return nil
+}
+
 func (s *Server) handleRequest(ctx context.Context, req *protocol.Message) (res *protocol.Message, err error) {
-	// pool res?
-	res = req.Clone()
-
-	res.SetMessageType(protocol.Response)
-
 	serviceName := req.ServicePath
 	methodName := req.ServiceMethod
 
+	res = req.Clone()
+
+	res.SetMessageType(protocol.Response)
 	s.serviceMapMu.RLock()
 	service := s.serviceMap[serviceName]
 	s.serviceMapMu.RUnlock()
@@ -336,23 +405,14 @@ func (s *Server) handleRequest(ctx context.Context, req *protocol.Message) (res 
 	}
 	mtype := service.method[methodName]
 	if mtype == nil {
+		if service.function[methodName] != nil { //check raw functions
+			return s.handleRequestForFunction(ctx, req)
+		}
 		err = errors.New("rpcx: can't find method " + methodName)
 		return handleError(res, err)
 	}
 
-	var argv, replyv reflect.Value
-
-	argIsValue := false // if true, need to indirect before calling.
-	if mtype.ArgType.Kind() == reflect.Ptr {
-		argv = reflect.New(mtype.ArgType.Elem())
-	} else {
-		argv = reflect.New(mtype.ArgType)
-		argIsValue = true
-	}
-
-	if argIsValue {
-		argv = argv.Elem()
-	}
+	var argv = argsReplyPools.Get(mtype.ArgType)
 
 	codec := share.Codecs[req.SerializeType()]
 	if codec == nil {
@@ -360,20 +420,85 @@ func (s *Server) handleRequest(ctx context.Context, req *protocol.Message) (res 
 		return handleError(res, err)
 	}
 
-	err = codec.Decode(req.Payload, argv.Interface())
+	err = codec.Decode(req.Payload, argv)
 	if err != nil {
 		return handleError(res, err)
 	}
 
-	replyv = reflect.New(mtype.ReplyType.Elem())
+	replyv := argsReplyPools.Get(mtype.ReplyType)
 
-	err = service.call(ctx, mtype, argv, replyv)
+	if mtype.ArgType.Kind() != reflect.Ptr {
+		err = service.call(ctx, mtype, reflect.ValueOf(argv).Elem(), reflect.ValueOf(replyv))
+	} else {
+		err = service.call(ctx, mtype, reflect.ValueOf(argv), reflect.ValueOf(replyv))
+	}
+
+	argsReplyPools.Put(mtype.ArgType, argv)
 	if err != nil {
+		argsReplyPools.Put(mtype.ReplyType, replyv)
 		return handleError(res, err)
 	}
 
 	if !req.IsOneway() {
-		data, err := codec.Encode(replyv.Interface())
+		data, err := codec.Encode(replyv)
+		argsReplyPools.Put(mtype.ReplyType, replyv)
+		if err != nil {
+			return handleError(res, err)
+
+		}
+		res.Payload = data
+	}
+
+	return res, nil
+}
+
+func (s *Server) handleRequestForFunction(ctx context.Context, req *protocol.Message) (res *protocol.Message, err error) {
+	res = req.Clone()
+
+	res.SetMessageType(protocol.Response)
+
+	serviceName := req.ServicePath
+	methodName := req.ServiceMethod
+	s.serviceMapMu.RLock()
+	service := s.serviceMap[serviceName]
+	s.serviceMapMu.RUnlock()
+	if service == nil {
+		err = errors.New("rpcx: can't find service  for func raw function")
+		return handleError(res, err)
+	}
+	mtype := service.function[methodName]
+	if mtype == nil {
+		err = errors.New("rpcx: can't find method " + methodName)
+		return handleError(res, err)
+	}
+
+	var argv = argsReplyPools.Get(mtype.ArgType)
+
+	codec := share.Codecs[req.SerializeType()]
+	if codec == nil {
+		err = fmt.Errorf("can not find codec for %d", req.SerializeType())
+		return handleError(res, err)
+	}
+
+	err = codec.Decode(req.Payload, argv)
+	if err != nil {
+		return handleError(res, err)
+	}
+
+	replyv := argsReplyPools.Get(mtype.ReplyType)
+
+	err = service.callForFunction(ctx, mtype, reflect.ValueOf(argv), reflect.ValueOf(replyv))
+
+	argsReplyPools.Put(mtype.ArgType, argv)
+
+	if err != nil {
+		argsReplyPools.Put(mtype.ReplyType, replyv)
+		return handleError(res, err)
+	}
+
+	if !req.IsOneway() {
+		data, err := codec.Encode(replyv)
+		argsReplyPools.Put(mtype.ReplyType, replyv)
 		if err != nil {
 			return handleError(res, err)
 

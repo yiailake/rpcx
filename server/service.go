@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"runtime"
+	"strings"
 	"sync"
 	"unicode"
 	"unicode/utf8"
@@ -24,14 +26,22 @@ type methodType struct {
 	method     reflect.Method
 	ArgType    reflect.Type
 	ReplyType  reflect.Type
-	numCalls   uint
+	// numCalls   uint
+}
+
+type functionType struct {
+	sync.Mutex // protects counters
+	fn         reflect.Value
+	ArgType    reflect.Type
+	ReplyType  reflect.Type
 }
 
 type service struct {
-	name   string                 // name of service
-	rcvr   reflect.Value          // receiver of methods for the service
-	typ    reflect.Type           // type of the receiver
-	method map[string]*methodType // registered methods
+	name     string                   // name of service
+	rcvr     reflect.Value            // receiver of methods for the service
+	typ      reflect.Type             // type of the receiver
+	method   map[string]*methodType   // registered methods
+	function map[string]*functionType // registered functions
 }
 
 func isExported(name string) bool {
@@ -51,7 +61,7 @@ func isExportedOrBuiltinType(t reflect.Type) bool {
 // Register publishes in the server the set of methods of the
 // receiver value that satisfy the following conditions:
 //	- exported method of exported type
-//	- three arguments, the first is of context.Context, both of exported type or three arguments
+//	- three arguments, the first is of context.Context, both of exported type for three arguments
 //	- the third argument is a pointer
 //	- one return value, of type error
 // It returns an error if the receiver is not an exported type or has
@@ -59,6 +69,7 @@ func isExportedOrBuiltinType(t reflect.Type) bool {
 // The client accesses each method using a string of the form "Type.Method",
 // where Type is the receiver's concrete type.
 func (s *Server) Register(rcvr interface{}, metadata string) error {
+	s.Plugins.DoRegister("", rcvr, metadata)
 	return s.register(rcvr, "", false)
 }
 
@@ -71,6 +82,27 @@ func (s *Server) RegisterName(name string, rcvr interface{}, metadata string) er
 
 	s.Plugins.DoRegister(name, rcvr, metadata)
 	return s.register(rcvr, name, true)
+}
+
+// RegisterFunction publishes a function that satisfy the following conditions:
+//	- three arguments, the first is of context.Context, both of exported type for three arguments
+//	- the third argument is a pointer
+//	- one return value, of type error
+// The client accesses function using a string of the form "servicePath.Method".
+func (s *Server) RegisterFunction(servicePath string, fn interface{}, metadata string) error {
+	s.Plugins.DoRegisterFunction("", fn, metadata)
+	return s.registerFunction(servicePath, fn, "", false)
+}
+
+// RegisterFunctionName is like RegisterFunction but uses the provided name for the function
+// instead of the function's concrete type.
+func (s *Server) RegisterFunctionName(servicePath string, name string, fn interface{}, metadata string) error {
+	if s.Plugins == nil {
+		s.Plugins = &pluginContainer{}
+	}
+
+	s.Plugins.DoRegisterFunction(name, fn, metadata)
+	return s.registerFunction(servicePath, fn, name, true)
 }
 
 func (s *Server) register(rcvr interface{}, name string, useName bool) error {
@@ -119,6 +151,85 @@ func (s *Server) register(rcvr interface{}, name string, useName bool) error {
 	return nil
 }
 
+func (s *Server) registerFunction(servicePath string, fn interface{}, name string, useName bool) error {
+	s.serviceMapMu.Lock()
+	defer s.serviceMapMu.Unlock()
+	if s.serviceMap == nil {
+		s.serviceMap = make(map[string]*service)
+	}
+
+	ss := s.serviceMap[servicePath]
+	if ss == nil {
+		ss = new(service)
+		ss.name = servicePath
+		ss.function = make(map[string]*functionType)
+	}
+
+	f, ok := fn.(reflect.Value)
+	if !ok {
+		f = reflect.ValueOf(fn)
+	}
+	if f.Kind() != reflect.Func {
+		return errors.New("function must be func or bound method")
+	}
+
+	fname := runtime.FuncForPC(reflect.Indirect(f).Pointer()).Name()
+	if fname != "" {
+		i := strings.LastIndex(fname, ".")
+		if i >= 0 {
+			fname = fname[i+1:]
+		}
+	}
+	if useName {
+		fname = name
+	}
+	if fname == "" {
+		errorStr := "rpcx.registerFunction: no func name for type " + f.Type().String()
+		log.Error(errorStr)
+		return errors.New(errorStr)
+	}
+
+	t := f.Type()
+	if t.NumIn() != 3 {
+		return fmt.Errorf("rpcx.registerFunction: has wrong number of ins: %s", f.Type().String())
+	}
+	if t.NumOut() != 1 {
+		return fmt.Errorf("rpcx.registerFunction: has wrong number of outs: %s", f.Type().String())
+	}
+
+	// First arg must be context.Context
+	ctxType := t.In(0)
+	if !ctxType.Implements(typeOfContext) {
+		return fmt.Errorf("function %s must use context as  the first parameter", f.Type().String())
+	}
+
+	argType := t.In(1)
+	if !isExportedOrBuiltinType(argType) {
+		return fmt.Errorf("function %s parameter type not exported: %v", f.Type().String(), argType)
+	}
+
+	replyType := t.In(2)
+	if replyType.Kind() != reflect.Ptr {
+		return fmt.Errorf("function %s reply type not a pointer: %s", f.Type().String(), replyType)
+	}
+	if !isExportedOrBuiltinType(replyType) {
+		return fmt.Errorf("function %s reply type not exported: %v", f.Type().String(), replyType)
+	}
+
+	// The return type of the method must be error.
+	if returnType := t.Out(0); returnType != typeOfError {
+		return fmt.Errorf("function %s returns %s, not error", f.Type().String(), returnType.String())
+	}
+
+	// Install the methods
+	ss.function[fname] = &functionType{fn: f, ArgType: argType, ReplyType: replyType}
+	s.serviceMap[servicePath] = ss
+
+	argsReplyPools.Init(argType)
+	argsReplyPools.Init(replyType)
+	return nil
+}
+
 // suitableMethods returns suitable Rpc methods of typ, it will report
 // error using log if reportErr is true.
 func suitableMethods(typ reflect.Type, reportErr bool) map[string]*methodType {
@@ -142,7 +253,7 @@ func suitableMethods(typ reflect.Type, reportErr bool) map[string]*methodType {
 		ctxType := mtype.In(1)
 		if !ctxType.Implements(typeOfContext) {
 			if reportErr {
-				log.Info("method", mname, "has wrong number of ins:", mtype.NumIn())
+				log.Info("method", mname, " must use context.Context as the first parameter")
 			}
 			continue
 		}
@@ -151,7 +262,7 @@ func suitableMethods(typ reflect.Type, reportErr bool) map[string]*methodType {
 		argType := mtype.In(2)
 		if !isExportedOrBuiltinType(argType) {
 			if reportErr {
-				log.Info(mname, "argument type not exported:", argType)
+				log.Info(mname, "parameter type not exported:", argType)
 			}
 			continue
 		}
@@ -185,6 +296,9 @@ func suitableMethods(typ reflect.Type, reportErr bool) map[string]*methodType {
 			continue
 		}
 		methods[mname] = &methodType{method: method, ArgType: argType, ReplyType: replyType}
+
+		argsReplyPools.Init(argType)
+		argsReplyPools.Init(replyType)
 	}
 	return methods
 }
@@ -192,13 +306,31 @@ func suitableMethods(typ reflect.Type, reportErr bool) map[string]*methodType {
 func (s *service) call(ctx context.Context, mtype *methodType, argv, replyv reflect.Value) (err error) {
 	defer func() {
 		if r := recover(); r != nil {
-			err = fmt.Errorf("internal error: %v", r)
+			err = fmt.Errorf("[service internal error]: %v", r)
 		}
 	}()
 
 	function := mtype.method.Func
 	// Invoke the method, providing a new value for the reply.
 	returnValues := function.Call([]reflect.Value{s.rcvr, reflect.ValueOf(ctx), argv, replyv})
+	// The return value for the method is an error.
+	errInter := returnValues[0].Interface()
+	if errInter != nil {
+		return errInter.(error)
+	}
+
+	return nil
+}
+
+func (s *service) callForFunction(ctx context.Context, ft *functionType, argv, replyv reflect.Value) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("[service internal error]: %v", r)
+		}
+	}()
+
+	// Invoke the function, providing a new value for the reply.
+	returnValues := ft.fn.Call([]reflect.Value{reflect.ValueOf(ctx), argv, replyv})
 	// The return value for the method is an error.
 	errInter := returnValues[0].Interface()
 	if errInter != nil {

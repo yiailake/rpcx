@@ -29,6 +29,8 @@ func newSelector(selectMode SelectMode, servers map[string]string) Selector {
 		return newWeightedICMPSelector(servers)
 	case ConsistentHash:
 		return newConsistentHashSelector(servers)
+	case SelectByUser:
+		return nil
 	default:
 		return newRandomSelector(servers)
 	}
@@ -40,7 +42,7 @@ type randomSelector struct {
 }
 
 func newRandomSelector(servers map[string]string) Selector {
-	var ss []string
+	var ss = make([]string, 0, len(servers))
 	for k := range servers {
 		ss = append(ss, k)
 	}
@@ -58,7 +60,7 @@ func (s randomSelector) Select(ctx context.Context, servicePath, serviceMethod s
 }
 
 func (s *randomSelector) UpdateServer(servers map[string]string) {
-	var ss []string
+	var ss = make([]string, 0, len(servers))
 	for k := range servers {
 		ss = append(ss, k)
 	}
@@ -73,28 +75,28 @@ type roundRobinSelector struct {
 }
 
 func newRoundRobinSelector(servers map[string]string) Selector {
-	var ss []string
+	var ss = make([]string, 0, len(servers))
 	for k := range servers {
 		ss = append(ss, k)
 	}
 
-	return &randomSelector{servers: ss}
+	return &roundRobinSelector{servers: ss}
 }
 
-func (s roundRobinSelector) Select(ctx context.Context, servicePath, serviceMethod string) string {
-	ss := s.servers
+func (s *roundRobinSelector) Select(ctx context.Context, servicePath, serviceMethod string, args interface{}) string {
+	var ss = s.servers
 	if len(ss) == 0 {
 		return ""
 	}
-
 	i := s.i
 	i = i % len(ss)
 	s.i = i + 1
+
 	return ss[i]
 }
 
 func (s *roundRobinSelector) UpdateServer(servers map[string]string) {
-	var ss []string
+	var ss = make([]string, 0, len(servers))
 	for k := range servers {
 		ss = append(ss, k)
 	}
@@ -112,7 +114,7 @@ func newWeightedRoundRobinSelector(servers map[string]string) Selector {
 	return &weightedRoundRobinSelector{servers: ss}
 }
 
-func (s weightedRoundRobinSelector) Select(ctx context.Context, servicePath, serviceMethod string, args interface{}) string {
+func (s *weightedRoundRobinSelector) Select(ctx context.Context, servicePath, serviceMethod string, args interface{}) string {
 	ss := s.servers
 	if len(ss) == 0 {
 		return ""
@@ -130,7 +132,7 @@ func (s *weightedRoundRobinSelector) UpdateServer(servers map[string]string) {
 }
 
 func createWeighted(servers map[string]string) []*Weighted {
-	var ss []*Weighted
+	var ss = make([]*Weighted, 0, len(servers))
 	for k, metadata := range servers {
 		w := &Weighted{Server: k, Weight: 1, EffectiveWeight: 1}
 
@@ -200,7 +202,7 @@ func (s *geoSelector) UpdateServer(servers map[string]string) {
 }
 
 func createGeoServer(servers map[string]string) []*geoServer {
-	var geoServers []*geoServer
+	var geoServers = make([]*geoServer, len(servers))
 
 	for s, metadata := range servers {
 		if v, err := url.ParseQuery(metadata); err == nil {
@@ -234,7 +236,7 @@ type consistentHashSelector struct {
 }
 
 func newConsistentHashSelector(servers map[string]string) Selector {
-	var ss []string
+	var ss = make([]string, 0, len(servers))
 	for k := range servers {
 		ss = append(ss, k)
 	}
@@ -252,7 +254,7 @@ func (s consistentHashSelector) Select(ctx context.Context, servicePath, service
 }
 
 func (s *consistentHashSelector) UpdateServer(servers map[string]string) {
-	var ss []string
+	var ss = make([]string, 0, len(servers))
 	for k := range servers {
 		ss = append(ss, k)
 	}

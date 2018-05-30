@@ -16,6 +16,7 @@ type PluginContainer interface {
 	All() []Plugin
 
 	DoRegister(name string, rcvr interface{}, metadata string) error
+	DoRegisterFunction(name string, fn interface{}, metadata string) error
 
 	DoPostConnAccept(net.Conn) (net.Conn, bool)
 
@@ -24,6 +25,9 @@ type PluginContainer interface {
 
 	DoPreWriteResponse(context.Context, *protocol.Message) error
 	DoPostWriteResponse(context.Context, *protocol.Message, *protocol.Message, error) error
+
+	DoPreWriteRequest(ctx context.Context) error
+	DoPostWriteRequest(ctx context.Context, r *protocol.Message, e error) error
 }
 
 // Plugin is the server plugin interface.
@@ -34,6 +38,11 @@ type (
 	// RegisterPlugin is .
 	RegisterPlugin interface {
 		Register(name string, rcvr interface{}, metadata string) error
+	}
+
+	// RegisterFunctionPlugin is .
+	RegisterFunctionPlugin interface {
+		RegisterFunction(name string, fn interface{}, metadata string) error
 	}
 
 	// PostConnAcceptPlugin represents connection accept plugin.
@@ -61,6 +70,16 @@ type (
 	//PostWriteResponsePlugin represents .
 	PostWriteResponsePlugin interface {
 		PostWriteResponse(context.Context, *protocol.Message, *protocol.Message, error) error
+	}
+
+	//PreWriteRequestPlugin represents .
+	PreWriteRequestPlugin interface {
+		PreWriteRequest(ctx context.Context) error
+	}
+
+	//PostWriteRequestPlugin represents .
+	PostWriteRequestPlugin interface {
+		PostWriteRequest(ctx context.Context, r *protocol.Message, e error) error
 	}
 )
 
@@ -100,6 +119,24 @@ func (p *pluginContainer) DoRegister(name string, rcvr interface{}, metadata str
 	for _, rp := range p.plugins {
 		if plugin, ok := rp.(RegisterPlugin); ok {
 			err := plugin.Register(name, rcvr, metadata)
+			if err != nil {
+				es = append(es, err)
+			}
+		}
+	}
+
+	if len(es) > 0 {
+		return errors.NewMultiError(es)
+	}
+	return nil
+}
+
+// DoRegisterFunction invokes DoRegisterFunction plugin.
+func (p *pluginContainer) DoRegisterFunction(name string, fn interface{}, metadata string) error {
+	var es []error
+	for _, rp := range p.plugins {
+		if plugin, ok := rp.(RegisterFunctionPlugin); ok {
+			err := plugin.RegisterFunction(name, fn, metadata)
 			if err != nil {
 				es = append(es, err)
 			}
@@ -174,6 +211,34 @@ func (p *pluginContainer) DoPostWriteResponse(ctx context.Context, req *protocol
 	for i := range p.plugins {
 		if plugin, ok := p.plugins[i].(PostWriteResponsePlugin); ok {
 			err := plugin.PostWriteResponse(ctx, req, resp, e)
+			if err != nil {
+				return err
+			}
+		}
+	}
+
+	return nil
+}
+
+// DoPreWriteRequest invokes PreWriteRequest plugin.
+func (p *pluginContainer) DoPreWriteRequest(ctx context.Context) error {
+	for i := range p.plugins {
+		if plugin, ok := p.plugins[i].(PreWriteRequestPlugin); ok {
+			err := plugin.PreWriteRequest(ctx)
+			if err != nil {
+				return err
+			}
+		}
+	}
+
+	return nil
+}
+
+// DoPostWriteRequest invokes PostWriteRequest plugin.
+func (p *pluginContainer) DoPostWriteRequest(ctx context.Context, r *protocol.Message, e error) error {
+	for i := range p.plugins {
+		if plugin, ok := p.plugins[i].(PostWriteRequestPlugin); ok {
+			err := plugin.PostWriteRequest(ctx, r, e)
 			if err != nil {
 				return err
 			}

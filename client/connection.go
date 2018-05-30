@@ -25,8 +25,10 @@ func (c *Client) Connect(network, address string) error {
 		conn, err = newDirectKCPConn(c, network, address)
 	case "quic":
 		conn, err = newDirectQuicConn(c, network, address)
+	case "unix":
+		conn, err = newDirectConn(c, network, address)
 	default:
-		conn, err = newDirectTCPConn(c, network, address)
+		conn, err = newDirectConn(c, network, address)
 	}
 
 	if err == nil && conn != nil {
@@ -53,7 +55,7 @@ func (c *Client) Connect(network, address string) error {
 	return err
 }
 
-func newDirectTCPConn(c *Client, network, address string) (net.Conn, error) {
+func newDirectConn(c *Client, network, address string) (net.Conn, error) {
 	var conn net.Conn
 	var tlsConn *tls.Conn
 	var err error
@@ -70,8 +72,13 @@ func newDirectTCPConn(c *Client, network, address string) (net.Conn, error) {
 	}
 
 	if err != nil {
-		log.Errorf("failed to dial server: %v", err)
+		log.Warnf("failed to dial server: %v", err)
 		return nil, err
+	}
+
+	if tc, ok := conn.(*net.TCPConn); ok {
+		tc.SetKeepAlive(true)
+		tc.SetKeepAlivePeriod(3 * time.Minute)
 	}
 
 	return conn, nil

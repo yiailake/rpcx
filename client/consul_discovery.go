@@ -4,6 +4,7 @@ package client
 
 import (
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/docker/libkv"
@@ -23,17 +24,22 @@ type ConsulDiscovery struct {
 	kv       store.Store
 	pairs    []*KVPair
 	chans    []chan []*KVPair
+	mu       sync.Locker
+	// -1 means it always retry to watch until zookeeper is ok, 0 means no retry.
+	RetriesAfterWatchFailed int
+
+	stopCh chan struct{}
 }
 
 // NewConsulDiscovery returns a new ConsulDiscovery.
-func NewConsulDiscovery(basePath string, consulAddr []string, options *store.Config) ServiceDiscovery {
+func NewConsulDiscovery(basePath, servicePath string, consulAddr []string, options *store.Config) ServiceDiscovery {
 	kv, err := libkv.NewStore(store.CONSUL, consulAddr, options)
 	if err != nil {
 		log.Infof("cannot create store: %v", err)
 		panic(err)
 	}
 
-	return NewConsulDiscoveryStore(basePath, kv)
+	return NewConsulDiscoveryStore(basePath+"/"+servicePath, kv)
 }
 
 // NewConsulDiscoveryStore returns a new ConsulDiscovery with specified store.
@@ -41,8 +47,13 @@ func NewConsulDiscoveryStore(basePath string, kv store.Store) ServiceDiscovery {
 	if basePath[0] == '/' {
 		basePath = basePath[1:]
 	}
+
+	if len(basePath) > 1 && strings.HasSuffix(basePath, "/") {
+		basePath = basePath[:len(basePath)-1]
+	}
+
 	d := &ConsulDiscovery{basePath: basePath, kv: kv}
-	go d.watch()
+	d.stopCh = make(chan struct{})
 
 	ps, err := kv.List(basePath)
 	if err != nil {
@@ -50,14 +61,40 @@ func NewConsulDiscoveryStore(basePath string, kv store.Store) ServiceDiscovery {
 		panic(err)
 	}
 
-	var pairs []*KVPair
+	var pairs = make([]*KVPair, 0, len(ps))
 	prefix := d.basePath + "/"
 	for _, p := range ps {
 		k := strings.TrimPrefix(p.Key, prefix)
 		pairs = append(pairs, &KVPair{Key: k, Value: string(p.Value)})
 	}
 	d.pairs = pairs
+	d.RetriesAfterWatchFailed = -1
+	go d.watch()
 	return d
+}
+
+// NewConsulDiscoveryTemplate returns a new ConsulDiscovery template.
+func NewConsulDiscoveryTemplate(basePath string, consulAddr []string, options *store.Config) ServiceDiscovery {
+	if basePath[0] == '/' {
+		basePath = basePath[1:]
+	}
+
+	if len(basePath) > 1 && strings.HasSuffix(basePath, "/") {
+		basePath = basePath[:len(basePath)-1]
+	}
+
+	kv, err := libkv.NewStore(store.CONSUL, consulAddr, options)
+	if err != nil {
+		log.Infof("cannot create store: %v", err)
+		panic(err)
+	}
+
+	return &ConsulDiscovery{basePath: basePath, kv: kv}
+}
+
+// Clone clones this ServiceDiscovery with new servicePath.
+func (d ConsulDiscovery) Clone(servicePath string) ServiceDiscovery {
+	return NewConsulDiscoveryStore(d.basePath+"/"+servicePath, d.kv)
 }
 
 // GetServices returns the servers
@@ -72,29 +109,95 @@ func (d *ConsulDiscovery) WatchService() chan []*KVPair {
 	return ch
 }
 
+func (d *ConsulDiscovery) RemoveWatcher(ch chan []*KVPair) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	var chans []chan []*KVPair
+	for _, c := range d.chans {
+		if c == ch {
+			continue
+		}
+
+		chans = append(chans, c)
+	}
+
+	d.chans = chans
+}
 func (d *ConsulDiscovery) watch() {
-	c, err := d.kv.WatchTree(d.basePath, nil)
-	if err != nil {
-		log.Fatalf("can not watchtree: %s: %v", d.basePath, err)
-		return
-	}
+	for {
+		var err error
+		var c <-chan []*store.KVPair
+		var tempDelay time.Duration
 
-	for ps := range c {
-		var pairs []*KVPair // latest servers
-		for _, p := range ps {
-			pairs = append(pairs, &KVPair{Key: p.Key, Value: string(p.Value)})
-		}
-		d.pairs = pairs
-
-		for _, ch := range d.chans {
-			ch := ch
-			go func() {
-				select {
-				case ch <- pairs:
-				case <-time.After(time.Minute):
-					log.Warn("chan is full and new change has ben dropped")
+		retry := d.RetriesAfterWatchFailed
+		for d.RetriesAfterWatchFailed == -1 || retry > 0 {
+			c, err = d.kv.WatchTree(d.basePath, nil)
+			if err != nil {
+				if d.RetriesAfterWatchFailed > 0 {
+					retry--
 				}
-			}()
+				if tempDelay == 0 {
+					tempDelay = 1 * time.Second
+				} else {
+					tempDelay *= 2
+				}
+				if max := 30 * time.Second; tempDelay > max {
+					tempDelay = max
+				}
+				log.Warnf("can not watchtree (with retry %d, sleep %v): %s: %v", retry, tempDelay, d.basePath, err)
+				time.Sleep(tempDelay)
+				continue
+			}
+			break
 		}
+
+		if err != nil {
+			log.Errorf("can't watch %s: %v", d.basePath, err)
+			return
+		}
+
+		prefix := d.basePath + "/"
+
+	readChanges:
+		for {
+			select {
+			case <-d.stopCh:
+				log.Info("discovery has been closed")
+				return
+			case ps := <-c:
+				if ps == nil {
+					break readChanges
+				}
+				var pairs []*KVPair // latest servers
+				for _, p := range ps {
+					k := strings.TrimPrefix(p.Key, prefix)
+					pairs = append(pairs, &KVPair{Key: k, Value: string(p.Value)})
+				}
+				d.pairs = pairs
+
+				for _, ch := range d.chans {
+					ch := ch
+					go func() {
+						defer func() {
+							if r := recover(); r != nil {
+
+							}
+						}()
+						select {
+						case ch <- pairs:
+						case <-time.After(time.Minute):
+							log.Warn("chan is full and new change has been dropped")
+						}
+					}()
+				}
+			}
+		}
+
+		log.Warn("chan is closed and will rewatch")
 	}
+}
+
+func (d *ConsulDiscovery) Close() {
+	close(d.stopCh)
 }

@@ -2,11 +2,13 @@ package client
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"reflect"
 	"sync"
 
 	"github.com/smallnest/rpcx/log"
+	"github.com/smallnest/rpcx/protocol"
 	"github.com/smallnest/rpcx/share"
 )
 
@@ -24,11 +26,22 @@ type inprocessClient struct {
 
 	methods map[string]*reflect.Value
 	mmu     sync.RWMutex
+
+	ServerMessageChan chan<- *protocol.Message
 }
 
 // Connect do a fake operaton.
 func (client *inprocessClient) Connect(network, address string) error {
 	return nil
+}
+
+func (client *inprocessClient) RegisterServerMessageChan(ch chan<- *protocol.Message) {
+	client.ServerMessageChan = ch
+}
+
+// UnregisterServerMessageChan removes ServerMessageChan.
+func (client *inprocessClient) UnregisterServerMessageChan() {
+	client.ServerMessageChan = nil
 }
 
 // Go calls is not async. It still use sync to call.
@@ -113,6 +126,10 @@ func (client *inprocessClient) Call(ctx context.Context, servicePath, serviceMet
 	}
 
 	return err
+}
+
+func (client *inprocessClient) SendRaw(ctx context.Context, r *protocol.Message) (map[string]string, []byte, error) {
+	return nil, nil, errors.New("SendRaw method is not supported by inprocessClient")
 }
 
 // Close do a fake operaton.

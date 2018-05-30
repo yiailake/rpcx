@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"net/url"
+	"sync"
 	"time"
 
 	"github.com/grandcat/zeroconf"
@@ -25,6 +26,10 @@ type MDNSDiscovery struct {
 	service       string
 	pairs         []*KVPair
 	chans         []chan []*KVPair
+
+	mu sync.Mutex
+
+	stopCh chan struct{}
 }
 
 // NewMDNSDiscovery returns a new MDNSDiscovery.
@@ -34,6 +39,8 @@ func NewMDNSDiscovery(service string, timeout time.Duration, watchInterval time.
 		domain = "local."
 	}
 	d := &MDNSDiscovery{service: service, Timeout: timeout, WatchInterval: watchInterval, domain: domain}
+	d.stopCh = make(chan struct{})
+
 	var err error
 	d.pairs, err = d.browse()
 	if err != nil {
@@ -41,6 +48,19 @@ func NewMDNSDiscovery(service string, timeout time.Duration, watchInterval time.
 	}
 	go d.watch()
 	return d
+}
+
+// NewMDNSDiscoveryTemplate returns a new MDNSDiscovery template.
+func NewMDNSDiscoveryTemplate(timeout time.Duration, watchInterval time.Duration, domain string) ServiceDiscovery {
+	if domain == "" {
+		domain = "local."
+	}
+	return &MDNSDiscovery{Timeout: timeout, WatchInterval: watchInterval, domain: domain}
+}
+
+// Clone clones this ServiceDiscovery with new servicePath.
+func (d MDNSDiscovery) Clone(servicePath string) ServiceDiscovery {
+	return NewMDNSDiscovery(servicePath, d.Timeout, d.WatchInterval, d.domain)
 }
 
 // GetServices returns the servers
@@ -55,21 +75,50 @@ func (d *MDNSDiscovery) WatchService() chan []*KVPair {
 	return ch
 }
 
+func (d *MDNSDiscovery) RemoveWatcher(ch chan []*KVPair) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	var chans []chan []*KVPair
+	for _, c := range d.chans {
+		if c == ch {
+			continue
+		}
+
+		chans = append(chans, c)
+	}
+
+	d.chans = chans
+}
+
 func (d *MDNSDiscovery) watch() {
 	t := time.NewTicker(d.WatchInterval)
-	for range t.C {
-		pairs, err := d.browse()
-		if err == nil {
-			d.pairs = pairs
-			for _, ch := range d.chans {
-				ch := ch
-				go func() {
-					select {
-					case ch <- pairs:
-					case <-time.After(time.Minute):
-						log.Warn("chan is full and new change has ben dropped")
-					}
-				}()
+
+	for {
+		select {
+		case <-d.stopCh:
+			t.Stop()
+			log.Info("discovery has been closed")
+			return
+		case <-t.C:
+			pairs, err := d.browse()
+			if err == nil {
+				d.pairs = pairs
+				for _, ch := range d.chans {
+					ch := ch
+					go func() {
+						defer func() {
+							if r := recover(); r != nil {
+
+							}
+						}()
+						select {
+						case ch <- pairs:
+						case <-time.After(time.Minute):
+							log.Warn("chan is full and new change has ben dropped")
+						}
+					}()
+				}
 			}
 		}
 	}
@@ -116,4 +165,8 @@ func (d *MDNSDiscovery) browse() ([]*KVPair, error) {
 
 	<-done
 	return totalServices, nil
+}
+
+func (d *MDNSDiscovery) Close() {
+	close(d.stopCh)
 }

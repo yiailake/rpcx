@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/docker/libkv"
@@ -34,28 +35,30 @@ type ZooKeeperRegisterPlugin struct {
 	Metrics  metrics.Registry
 	// Registered services
 	Services       []string
+	metasLock      sync.RWMutex
+	metas          map[string]string
 	UpdateInterval time.Duration
 
 	Options *store.Config
-	KV      store.Store
+	kv      store.Store
 }
 
 // Start starts to connect zookeeper cluster
 func (p *ZooKeeperRegisterPlugin) Start() error {
-	if p.KV == nil {
+	if p.kv == nil {
 		kv, err := libkv.NewStore(store.ZK, p.ZooKeeperServers, p.Options)
 		if err != nil {
 			log.Errorf("cannot create zk registry: %v", err)
 			return err
 		}
-		p.KV = kv
+		p.kv = kv
 	}
 
 	if p.BasePath[0] == '/' {
 		p.BasePath = p.BasePath[1:]
 	}
 
-	err := p.KV.Put(p.BasePath, []byte("rpcx_path"), &store.WriteOptions{IsDir: true})
+	err := p.kv.Put(p.BasePath, []byte("rpcx_path"), &store.WriteOptions{IsDir: true})
 	if err != nil {
 		log.Errorf("cannot create zk path %s: %v", p.BasePath, err)
 		return err
@@ -64,22 +67,34 @@ func (p *ZooKeeperRegisterPlugin) Start() error {
 	if p.UpdateInterval > 0 {
 		ticker := time.NewTicker(p.UpdateInterval)
 		go func() {
-			defer p.KV.Close()
+			defer p.kv.Close()
 
 			// refresh service TTL
 			for range ticker.C {
-				clientMeter := metrics.GetOrRegisterMeter("clientMeter", p.Metrics)
-				data := []byte(strconv.FormatInt(clientMeter.Count()/60, 10))
+				var data []byte
+				if p.Metrics != nil {
+					clientMeter := metrics.GetOrRegisterMeter("clientMeter", p.Metrics)
+					data = []byte(strconv.FormatInt(clientMeter.Count()/60, 10))
+				}
 				//set this same metrics for all services at this server
 				for _, name := range p.Services {
 					nodePath := fmt.Sprintf("%s/%s/%s", p.BasePath, name, p.ServiceAddress)
-					kvPaire, err := p.KV.Get(nodePath)
+					kvPaire, err := p.kv.Get(nodePath)
 					if err != nil {
 						log.Infof("can't get data of node: %s, because of %v", nodePath, err.Error())
+
+						p.metasLock.RLock()
+						meta := p.metas[name]
+						p.metasLock.RUnlock()
+
+						err = p.kv.Put(nodePath, []byte(meta), &store.WriteOptions{TTL: p.UpdateInterval * 3})
+						if err != nil {
+							log.Errorf("cannot re-create zookeeper path %s: %v", nodePath, err)
+						}
 					} else {
 						v, _ := url.ParseQuery(string(kvPaire.Value))
 						v.Set("tps", string(data))
-						p.KV.Put(nodePath, []byte(v.Encode()), &store.WriteOptions{TTL: p.UpdateInterval * 2})
+						p.kv.Put(nodePath, []byte(v.Encode()), &store.WriteOptions{TTL: p.UpdateInterval * 3})
 					}
 				}
 
@@ -107,39 +122,46 @@ func (p *ZooKeeperRegisterPlugin) Register(name string, rcvr interface{}, metada
 		return
 	}
 
-	if p.KV == nil {
+	if p.kv == nil {
 		zookeeper.Register()
 		kv, err := libkv.NewStore(store.ZK, p.ZooKeeperServers, nil)
 		if err != nil {
 			log.Errorf("cannot create zk registry: %v", err)
 			return err
 		}
-		p.KV = kv
+		p.kv = kv
 	}
 
 	if p.BasePath[0] == '/' {
 		p.BasePath = p.BasePath[1:]
 	}
-	err = p.KV.Put(p.BasePath, []byte("rpcx_path"), &store.WriteOptions{IsDir: true})
+	err = p.kv.Put(p.BasePath, []byte("rpcx_path"), &store.WriteOptions{IsDir: true})
 	if err != nil {
 		log.Errorf("cannot create zk path %s: %v", p.BasePath, err)
 		return err
 	}
 
 	nodePath := fmt.Sprintf("%s/%s", p.BasePath, name)
-	err = p.KV.Put(nodePath, []byte(name), &store.WriteOptions{IsDir: true})
+	err = p.kv.Put(nodePath, []byte(name), &store.WriteOptions{IsDir: true})
 	if err != nil {
 		log.Errorf("cannot create zk path %s: %v", nodePath, err)
 		return err
 	}
 
 	nodePath = fmt.Sprintf("%s/%s/%s", p.BasePath, name, p.ServiceAddress)
-	err = p.KV.Put(nodePath, []byte(p.ServiceAddress), &store.WriteOptions{TTL: p.UpdateInterval * 2})
+	err = p.kv.Put(nodePath, []byte(metadata), &store.WriteOptions{TTL: p.UpdateInterval * 2})
 	if err != nil {
 		log.Errorf("cannot create zk path %s: %v", nodePath, err)
 		return err
 	}
 
 	p.Services = append(p.Services, name)
+
+	p.metasLock.Lock()
+	if p.metas == nil {
+		p.metas = make(map[string]string)
+	}
+	p.metas[name] = metadata
+	p.metasLock.Unlock()
 	return
 }
